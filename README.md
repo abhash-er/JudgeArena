@@ -273,7 +273,7 @@ This override applies to all vLLM models in the run. For remote providers (OpenA
 
 ## 📊 Supported Tasks
 
-Generate+judge tasks produce pairwise preferences between two models. Elo tasks estimate a single model's rating against human-annotated arena opponents. Meta-evaluation tasks score a judge against human arena votes.
+Generate+judge tasks produce pairwise preferences or independent annotations for each answer. Elo tasks estimate a single model's rating against human-annotated arena opponents. Meta-evaluation tasks score a judge against human arena votes.
 
 ### Custom datasets and annotations
 
@@ -328,6 +328,12 @@ For m-Arena-Hard, baseline completions are tied to the benchmark release:
   from `CohereLabs/deja-vu-pairwise-evals` (repeat 0) via
   [`scripts/multilingual_arena_hard/ingest_deja_vu_aya_references.py`](scripts/multilingual_arena_hard/ingest_deja_vu_aya_references.py).
 - `m-arena-hard-v2.0`: Gemini 2.5 Flash (`google/gemini-2.5-flash`).
+
+### Independent evaluation
+
+Independent evaluation also supports custom prompt/parser presets. Parsed
+scores, correctness labels, and criterion results are saved in annotations;
+configured metrics decide how to summarize them. See [independent evaluation](judgearena/tasks/README.md#independent-evaluation).
 
 ### ELO rating
 

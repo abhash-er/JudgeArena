@@ -27,6 +27,7 @@ from judgearena.tasks.schema import (
     EloScoringSpec,
     MetaEvalProtocol,
     ResolvedTaskSpec,
+    SingleAnswerProtocol,
     TaskDefaultBaseline,
 )
 
@@ -208,7 +209,7 @@ class JudgePromptSpec(BaseModel):
 
 
 class JudgeArgs(BaseModel):
-    """The judge model and how it scores each battle."""
+    """The judge model, prompt, and inference settings."""
 
     model_config = ConfigDict(
         protected_namespaces=(), use_attribute_docstrings=True, extra="forbid"
@@ -261,10 +262,10 @@ class JudgeArgs(BaseModel):
     to the task's preset when unset."""
 
     criteria_name: str | None = None
-    """Built-in rubric for the ``criteria`` prompt preset; defaults to ``default``."""
+    """Built-in rubric for ``criteria`` or ``criteria-score``; defaults to ``default``."""
 
     criteria_file: Path | None = None
-    """Criteria YAML for the ``criteria`` preset, overriding ``criteria_name``."""
+    """Criteria YAML for either criteria preset, overriding ``criteria_name``."""
 
     prompt: JudgePromptSpec | None = None
     """Custom judge prompt bundle (system/user template files plus the parser
@@ -540,7 +541,9 @@ class RunConfig(BaseSettings):
         judge_values = self.judge.model_dump(exclude_unset=True)
         judge_fields = self.judge.model_fields_set.copy()
         if "swap_mode" not in judge_values:
-            judge_values["swap_mode"] = task_judge.default_swap_mode
+            judge_values["swap_mode"] = getattr(
+                task_judge, "default_swap_mode", "fixed"
+            )
         judge_engine_kwargs = self.judge_engine_kwargs()
         for field, engine_key in (
             ("temperature", "temperature"),
@@ -585,7 +588,12 @@ class RunConfig(BaseSettings):
         else:
             if self.model.name is None:
                 raise ValueError("model.name is required.")
-            if self.model.baseline is None and not isinstance(
+            if isinstance(protocol, SingleAnswerProtocol):
+                if self.model.baseline is not None or self.judge.swap_mode != "fixed":
+                    raise ValueError(
+                        "Independent single-answer evaluation does not use a baseline or swapped judging."
+                    )
+            elif self.model.baseline is None and not isinstance(
                 protocol.baseline, (TaskDefaultBaseline, CategoryDefaultsBaseline)
             ):
                 raise ValueError(f"model.baseline is required for task {self.task!r}.")
@@ -602,6 +610,13 @@ class RunConfig(BaseSettings):
             self.judge.model,
             self.model.engine_kwargs,
             judge_engine_kwargs_override=self.judge.engine_kwargs,
+        )
+
+    def judge_model_kwargs(self) -> dict[str, object]:
+        """Effective judge settings for prompt validation and model construction."""
+        return self.judge.model_kwargs(
+            base_engine_kwargs=self.judge_engine_kwargs(),
+            fallback_chat_template=self.model.chat_template,
         )
 
     def for_task(self, task: ResolvedTaskSpec | None) -> RunConfig:

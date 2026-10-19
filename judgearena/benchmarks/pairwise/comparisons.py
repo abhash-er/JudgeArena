@@ -121,6 +121,40 @@ def conversation_comparisons(
     return pd.DataFrame(rows).set_index("comparison_id")
 
 
+def prepare_answers(
+    cfg,
+    data: CompletionData,
+    selected: pd.DataFrame,
+    model: str,
+    *,
+    role: Literal["A", "B"],
+) -> pd.Series:
+    """Load saved answers and generate missing ones using the task's input format."""
+    generation = cfg.resolved_task.spec.protocol.generation
+    if generation.mode == "provided_messages":
+        _require_columns(selected, {"messages"}, "Provided-history generation")
+    if generation.mode == "multi_turn_chat":
+        return load_conversations(cfg, data, selected, model, role=role)
+    inputs = selected["instruction"]
+    if generation.mode == "provided_messages":
+        inputs = selected["messages"].set_axis(
+            selected.get("instruction_id", selected.index)
+        )
+    return load_or_generate_completions(
+        cfg,
+        model,
+        inputs,
+        data.model_completion(model, instruction_ids=selected.index),
+        role=role,
+        generate={
+            "base_completion": generate_base,
+            "single_turn_chat": generate_instructions,
+            "provided_messages": generate_messages,
+        }[generation.mode],
+        use_tqdm=cfg.run.use_tqdm,
+    ).set_axis(selected.index)
+
+
 def prepare_comparisons(
     cfg: RunConfig,
     data: CompletionData,
@@ -131,37 +165,18 @@ def prepare_comparisons(
     generation = cfg.resolved_task.spec.protocol.generation
     conversations = generation.mode == "multi_turn_chat"
     provided_messages = generation.mode == "provided_messages"
-    if provided_messages:
-        _require_columns(instructions, {"messages"}, "Provided-history generation")
-
-    def load(model, role, ids):
-        selected = instructions.loc[ids]
-        if conversations:
-            return load_conversations(cfg, data, selected, model, role=role)
-        inputs = selected["instruction"]
-        if provided_messages:
-            inputs = selected["messages"].set_axis(
-                selected.get("instruction_id", selected.index)
-            )
-        return load_or_generate_completions(
-            cfg,
-            model,
-            inputs,
-            data.model_completion(model, instruction_ids=ids),
-            role=role,
-            generate={
-                "base_completion": generate_base,
-                "single_turn_chat": generate_instructions,
-                "provided_messages": generate_messages,
-            }[generation.mode],
-            use_tqdm=cfg.run.use_tqdm,
-        ).set_axis(ids)
 
     baseline = baseline_plan.aligned_to(instructions.index)
-    a = load(cfg.model.name, "A", instructions.index)
+    a = prepare_answers(cfg, data, instructions, cfg.model.name, role="A")
     b = pd.concat(
         [
-            load(model, "B", baseline.index[baseline == model])
+            prepare_answers(
+                cfg,
+                data,
+                instructions.loc[baseline.index[baseline == model]],
+                model,
+                role="B",
+            )
             for model in baseline_plan.unique_models
         ]
     ).reindex(instructions.index)

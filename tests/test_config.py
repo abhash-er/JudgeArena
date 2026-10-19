@@ -17,7 +17,7 @@ from judgearena.config import (
 )
 from judgearena.prompts.registry import resolve_run_judge_prompt
 from judgearena.tasks.registry import get_packaged_task
-from judgearena.tasks.schema import EloScoringSpec, MetricSpec
+from judgearena.tasks.schema import EloScoringSpec, MetricSpec, RuntimeRequiredBaseline
 
 
 @pytest.mark.parametrize("override", [None, 0.8])
@@ -157,6 +157,7 @@ def _registered_task(
         task=task_id,
         spec=SimpleNamespace(
             protocol=SimpleNamespace(
+                baseline=RuntimeRequiredBaseline(strategy="runtime_required"),
                 generation=SimpleNamespace(
                     default_max_out_tokens=1024,
                     default_seed=7,

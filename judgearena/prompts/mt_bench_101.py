@@ -74,6 +74,7 @@ class MTBench101ScoreParser:
     """Parse the score format associated with an MT-Bench-101 prompt preset."""
 
     name = "mt-bench-101-score"
+    result_type = ParsedScore
     requires_top_logprobs = False
 
     def __init__(self, prompt_preset: str = MT_BENCH_101_PROMPT_PRESET) -> None:
@@ -181,6 +182,7 @@ def build_mt_bench_101_judge_prompt(
         )
     return ResolvedJudgePrompt(
         preset_name=prompt_preset,
+        judging_mode="single_answer",
         variant_name=task,
         parser=MTBench101ScoreParser(prompt_preset),
         system_prompt=system_prompt,

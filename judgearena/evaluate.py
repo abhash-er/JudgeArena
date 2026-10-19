@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 
+import pandas as pd
 from langchain_core.prompt_values import PromptValue
 
 from judgearena.cache.inference import JudgementCacheRowMetadata
 from judgearena.judging import (
     JudgeRequest,
     execute_judging,
+    judge_single_answers,
 )
 from judgearena.log import get_logger
 from judgearena.models import InferenceResult, do_inference
 from judgearena.prompts.registry import (
     DEFAULT_JUDGE_PROMPT_PRESET,
     ResolvedJudgePrompt,
-    build_pairwise_chat_prompt_template,
+    build_chat_prompt_template,
+    group_judge_prompts,
     resolve_judge_prompt,
 )
 from judgearena.prompts.registry import (
@@ -87,30 +91,62 @@ class JudgeAnnotation:
     parsed: ParsedPreference | None = None
 
 
+def _prompt_fields(**fields):
+    return {
+        **fields,
+        **{
+            f"{key}_json": json.dumps(value, ensure_ascii=False)
+            for key, value in fields.items()
+        },
+    }
+
+
+def validate_prompt_fields(prompt: ResolvedJudgePrompt, columns, supplied) -> None:
+    """Require template metadata before generating candidate answers."""
+    required = set(build_chat_prompt_template(prompt).input_variables)
+    missing = (
+        required - set(columns) - _prompt_fields(**dict.fromkeys(supplied, "")).keys()
+    )
+    if missing:
+        raise ValueError(f"Judge prompt requires dataset columns: {sorted(missing)}.")
+
+
+def validate_battle_prompt_fields(prompt: ResolvedJudgePrompt, columns) -> None:
+    validate_prompt_fields(
+        prompt, columns, ("user_prompt", "completion_A", "completion_B")
+    )
+
+
 def render_battle_inputs(
     instructions: list[str],
     completions_A: list[str],
     completions_B: list[str],
     prompt: ResolvedJudgePrompt,
     truncate_input_chars: int | None,
+    *,
+    metadata: list[dict[str, object]] | None = None,
 ) -> list[PromptValue]:
     """Render text comparisons, preserving JSON escaping and answer truncation."""
-    prompt_template = build_pairwise_chat_prompt_template(prompt)
+    prompt_template = build_chat_prompt_template(prompt)
 
     prompt_inputs = []
-    for user_prompt, completion_A, completion_B in zip(
-        instructions, completions_A, completions_B, strict=True
+    for user_prompt, completion_A, completion_B, row in zip(
+        instructions,
+        completions_A,
+        completions_B,
+        metadata if metadata is not None else [{}] * len(instructions),
+        strict=True,
     ):
         completion_A = truncate(completion_A, max_len=truncate_input_chars)
         completion_B = truncate(completion_B, max_len=truncate_input_chars)
         prompt_inputs.append(
             {
-                "user_prompt": user_prompt,
-                "completion_A": completion_A,
-                "completion_B": completion_B,
-                "user_prompt_json": json.dumps(user_prompt, ensure_ascii=False),
-                "completion_A_json": json.dumps(completion_A, ensure_ascii=False),
-                "completion_B_json": json.dumps(completion_B, ensure_ascii=False),
+                **row,
+                **_prompt_fields(
+                    user_prompt=user_prompt,
+                    completion_A=completion_A,
+                    completion_B=completion_B,
+                ),
             }
         )
     return prompt_template.batch(prompt_inputs)
@@ -178,6 +214,10 @@ def annotate_battles(
             f"Judge prompt preset '{resolved_prompt.preset_name}' is delegated and "
             "cannot be used for generic pairwise judging."
         )
+    effective_prompt = (
+        replace(resolved_prompt, parser=parse) if parse is not None else resolved_prompt
+    )
+    effective_prompt.validate_for("pairwise")
 
     if strip_thinking_before_judging:
         completions_A = [strip_thinking_tags(c) for c in completions_A]
@@ -220,7 +260,9 @@ def annotate_battles(
                 zip(inputs, metadata, strict=True)
             )
         ]
-        results = execute_judging(judge_chat_model, requests, use_tqdm=use_tqdm)
+        results = execute_judging(
+            judge_chat_model, requests, use_tqdm=use_tqdm, result_type=ParsedPreference
+        )
         outcomes = ((result.response, result.parsed) for result in results)
 
     return [
@@ -263,6 +305,7 @@ def render_comparison_requests(comparisons, prompt, truncate_input_chars):
         comparisons.completion_b.tolist(),
         prompt,
         truncate_input_chars,
+        metadata=comparisons.to_dict("records"),
     )
     return [
         [
@@ -270,3 +313,84 @@ def render_comparison_requests(comparisons, prompt, truncate_input_chars):
             for identity, value in zip(comparisons.index, inputs, strict=True)
         ]
     ]
+
+
+def render_single_requests(
+    samples, *, prompt, truncate_input_chars, strip_thinking_before_judging
+):
+    """Render one answer with its metadata; preserve parser-defined result types."""
+    inputs = []
+    for row in samples.to_dict("records"):
+        completion = row["completion"]
+        if strip_thinking_before_judging:
+            completion = strip_thinking_tags(completion)
+        inputs.append(
+            {
+                **row,
+                **_prompt_fields(
+                    user_prompt=row["instruction"],
+                    completion=truncate(completion, max_len=truncate_input_chars),
+                ),
+            }
+        )
+    rendered = build_chat_prompt_template(prompt).batch(inputs)
+    requests = [
+        JudgeRequest(str(identity), value, prompt.parser)
+        for identity, value in zip(samples.index, rendered, strict=True)
+    ]
+    return samples.iloc[:, :0], requests, [prompt] * len(samples)
+
+
+def prepare_single_answer_judging(
+    cfg, resolved_prompt, instructions, *, result_type: type | None = None
+):
+    """Resolve and validate per-row prompts before generating answers."""
+    groups = group_judge_prompts(cfg, instructions, resolved_prompt)
+    renderers = []
+    for prompt, ids in groups:
+        prompt.validate_for(
+            "single_answer", result_type, inference_kwargs=cfg.judge_model_kwargs()
+        )
+        kwargs = dict(
+            truncate_input_chars=cfg.generation.truncate_judge_input_chars,
+            strip_thinking_before_judging=cfg.judge.strip_thinking_before_judging,
+        )
+        if prompt.score_renderer is not None:
+            render = partial(
+                prompt.score_renderer, prompt_preset=prompt.preset_name, **kwargs
+            )
+        else:
+            if prompt.delegated:
+                raise ValueError(
+                    "Independent judging requires a parser and a renderable prompt."
+                )
+            validate_prompt_fields(
+                prompt, instructions.columns, ("user_prompt", "completion")
+            )
+            render = partial(render_single_requests, prompt=prompt, **kwargs)
+        renderers.append((ids, render))
+
+    def judge(model, samples):
+        frames, prompts = [], []
+        source_ids = samples.get("source_instruction_index", samples.index)
+        for ids, render in renderers:
+            selected = samples.loc[source_ids.isin(ids)]
+            if not selected.empty:
+                frame, used = judge_single_answers(
+                    model,
+                    selected,
+                    render,
+                    use_tqdm=cfg.run.use_tqdm,
+                    result_type=result_type,
+                )
+                frames.append(frame)
+                prompts.extend(used)
+        annotations = (
+            pd.concat(frames, ignore_index=True)
+            .set_index("instruction_index", drop=False)
+            .loc[samples.index]
+            .reset_index(drop=True)
+        )
+        return annotations, prompts
+
+    return judge

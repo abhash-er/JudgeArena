@@ -236,5 +236,97 @@ def test_every_preset_resolves_or_delegates():
         if spec.delegated:
             assert resolved.delegated is True
         else:
-            assert resolved.system_prompt
+            assert resolved.system_prompt is not None or spec.system_file is None
             assert resolved.user_prompt_template
+
+
+def test_standard_prompt_uses_metadata_without_overriding_swapped_answers():
+    prompt = replace(
+        resolve_judge_prompt(preset="default"),
+        system_prompt="Use {rubric}",
+        user_prompt_template="{history}|{user_prompt}|{completion_A}|{completion_B_json}",
+    )
+    comparisons = pd.DataFrame(
+        {
+            "instruction": ["Question"],
+            "completion_a": ["First"],
+            "completion_b": ["Second"],
+            "model_a": ["a"],
+            "model_b": ["b"],
+            "history": ['JSON {"x": 1}'],
+            "rubric": ["Accuracy"],
+            "completion_A": ["stale"],
+            "completion_B_json": ["stale"],
+        },
+        index=["q"],
+    )
+    annotations = judge_comparisons(
+        DummyModel("Dummy/score_A: 8\nscore_B: 4"),
+        comparisons,
+        [(prompt, comparisons.index)],
+        swap_mode="both",
+        strip_thinking_before_judging=False,
+        truncate_input_chars=None,
+        use_tqdm=False,
+    )
+    assert 'JSON {"x": 1}|Question|First|"Second"' in annotations.iloc[0].judge_input
+    assert 'JSON {"x": 1}|Question|Second|"First"' in annotations.iloc[1].judge_input
+    assert all("Use Accuracy" in value for value in annotations.judge_input)
+    assert annotations.pref.tolist() == pytest.approx([0.2314752165, 0.7685247835])
+
+
+def test_missing_prompt_metadata_fails_during_preparation():
+    from judgearena.benchmarks.pairwise.judging import prepare_pairwise_judging
+    from judgearena.config import build_run_config
+
+    cfg = build_run_config(
+        ["--task", "alpaca-eval", "--model.name", "Dummy/a", "--judge.model", "Dummy/j"]
+    )
+    prompt = replace(
+        resolve_judge_prompt(preset="default"), system_prompt="Use {rubric}"
+    )
+    with pytest.raises(ValueError, match="rubric"):
+        prepare_pairwise_judging(cfg, prompt, pd.DataFrame({"instruction": ["Q"]}))
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, True, 1.5, "5"])
+def test_logprob_prompt_requires_a_positive_integer_count(count):
+    settings = {"top_logprobs": count}
+    resolve_judge_prompt(preset="default").validate_for(
+        "pairwise", inference_kwargs=settings
+    )
+    with pytest.raises(ValueError, match="top_logprobs"):
+        resolve_judge_prompt(preset="alpaca-eval").validate_for(
+            "pairwise", inference_kwargs=settings
+        )
+
+
+@pytest.mark.parametrize(
+    "preset,mode", [("single-score", "pairwise"), ("default", "single_answer")]
+)
+def test_prompt_rejects_wrong_judging_mode(preset, mode):
+    with pytest.raises(ValueError, match="judging mode"):
+        resolve_judge_prompt(preset=preset).validate_for(mode)
+
+
+def test_category_prompt_validates_parser_during_preparation(monkeypatch):
+    from judgearena.benchmarks.pairwise.judging import prepare_pairwise_judging
+    from judgearena.config import RunConfig
+
+    cfg = RunConfig(
+        task="arena-hard-v2.0", model={"name": "Dummy/a"}, judge={"model": "Dummy/j"}
+    )
+    monkeypatch.setitem(
+        PRESETS,
+        "arena-hard-creative",
+        replace(
+            PRESETS["arena-hard-creative"],
+            parser=resolve_judge_prompt(preset="single-score").parser,
+        ),
+    )
+    with pytest.raises(ValueError, match="ParsedPreference"):
+        prepare_pairwise_judging(
+            cfg,
+            resolve_judge_prompt(preset="arena-hard"),
+            pd.DataFrame({"instruction": ["Q"], "category": ["creative_writing"]}),
+        )

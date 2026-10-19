@@ -15,6 +15,7 @@ from judgearena.prompts.parsing import JUDGE_PARSERS, PairScore, ParsedScore
 def test_executor_keeps_mixed_parser_results_and_unparseable_responses_in_order():
     rating = SimpleNamespace(
         name="rating",
+        result_type=ParsedScore,
         requires_top_logprobs=False,
         parse_result=lambda text, **_: ParsedScore(score=float(text)),
     )
@@ -80,6 +81,53 @@ def test_executor_reparses_cached_output_without_loading_the_model(tmp_path):
     assert second.response.text == "score_A: 6\nscore_B: 8"
 
 
+def test_executor_preserves_responses_missing_required_logprobs(caplog):
+    parser = SimpleNamespace(
+        name="requires-logprobs",
+        result_type=ParsedScore,
+        requires_top_logprobs=True,
+        parse_result=lambda *_args, **_kwargs: pytest.fail("Missing parser input"),
+    )
+    outputs = [
+        "M",
+        AIMessage(
+            content="m",
+            response_metadata={"logprobs": {"content": [{"top_logprobs": []}]}},
+        ),
+        AIMessage(
+            content="M",
+            response_metadata={
+                "logprobs": {
+                    "content": [{"top_logprobs": [{"token": "x", "logprob": -0.1}]}]
+                }
+            },
+        ),
+        '{"score": 8}',
+    ]
+    requests = [
+        JudgeRequest(str(i), "Q", parse)
+        for i, parse in enumerate(
+            [
+                parser,
+                parser,
+                JUDGE_PARSERS["alpaca-eval-token"],
+                JUDGE_PARSERS["json-score"],
+            ]
+        )
+    ]
+
+    results = execute_judging(
+        SimpleNamespace(batch=lambda inputs, **_: outputs), requests
+    )
+
+    assert [r.response.text for r in results] == ["M", "m", "M", '{"score": 8}']
+    assert [r.parsed for r in results[:3]] == [None, None, None]
+    assert results[3].parsed.score == 8
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "2" in warnings[0] and "logprobs" in warnings[0]
+
+
 def test_executor_rejects_duplicate_ids_before_inference():
     request = JudgeRequest("same", "prompt", PairScore())
     with pytest.raises(ValueError, match="unique"):
@@ -88,6 +136,30 @@ def test_executor_rejects_duplicate_ids_before_inference():
 
 def test_executor_empty_batch_does_not_need_a_model():
     assert execute_judging(object(), []) == []
+
+
+def test_executor_rejects_result_that_breaks_parser_contract():
+    parser = SimpleNamespace(
+        name="broken-score",
+        result_type=ParsedScore,
+        requires_top_logprobs=False,
+        parse_result=lambda text, **_: {"score": 8},
+    )
+    with pytest.raises(TypeError, match="broken-score.*ParsedScore"):
+        execute_judging(FakeListLLM(responses=["8"]), [JudgeRequest("q", "Q", parser)])
+
+
+def test_annotation_list_api_rejects_incompatible_parser_override():
+    with pytest.raises(ValueError, match="ParsedPreference"):
+        evaluate.annotate_battles(
+            object(),
+            ["Q"],
+            ["A"],
+            ["B"],
+            False,
+            prompt=evaluate.resolve_judge_prompts(prompt_preset="default"),
+            parse=JUDGE_PARSERS["single-score"],
+        )
 
 
 def test_executor_rejects_partial_cache_metadata_before_inference():

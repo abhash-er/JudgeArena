@@ -21,6 +21,7 @@ from judgearena.tasks.schema.pairwise import (
     MultiTurnGeneration,
     PairwiseJudgeSpec,
     PairwiseProtocol,
+    SingleAnswerProtocol,
     SingleTurnGeneration,
     SwapMode,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "ResourceDigest",
     "RuntimeRequiredBaseline",
     "ScoringSpec",
+    "SingleAnswerProtocol",
     "SingleTurnGeneration",
     "SourceSpec",
     "SuffixVariants",

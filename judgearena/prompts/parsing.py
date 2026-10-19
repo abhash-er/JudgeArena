@@ -48,6 +48,8 @@ class OutputParser[T](Protocol):
     """Parse a judge response without prescribing the result's meaning."""
 
     name: str
+    result_type: type[T]
+    """Runtime type of a successful parse; unparseable responses return None."""
     requires_top_logprobs: bool
 
     def parse_result(
@@ -55,11 +57,25 @@ class OutputParser[T](Protocol):
     ) -> T | None: ...
 
 
+def validate_parser(parser: OutputParser, expected: type | None = None) -> None:
+    """Check the declared output before inference, without calling the parser."""
+    result_type = getattr(parser, "result_type", None)
+    if not isinstance(result_type, type):
+        raise ValueError(f"Parser {parser_name(parser)!r} must declare a result_type.")
+    if expected is not None and not issubclass(result_type, expected):
+        raise ValueError(
+            f"Parser {parser_name(parser)!r} must return {expected.__name__}; "
+            f"declares {result_type.__name__}."
+        )
+
+
 class JudgeParser(abc.ABC):
     """Parses judge output into a canonical preference and supporting evidence."""
 
     name: str
     """Registry key and run-metadata identifier."""
+
+    result_type = ParsedPreference
 
     requires_top_logprobs: bool = False
     """Whether this parser requires first-token top logprobs."""
@@ -155,6 +171,62 @@ class ArenaHardVerdict(JudgeParser):
         if preference is None:
             return None
         return ParsedPreference(preference=preference, label=label)
+
+
+def _json_judge_field(judge_completion: str, field: str) -> dict:
+    """Read JSON evidence, falling back to a complete verdict-field value."""
+    text = strip_thinking_tags(judge_completion).strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced[1]
+    try:
+        details = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(
+            r'"' + re.escape(field) + r'"\s*:\s*("(?:\\.|[^"\\])*"|[^,}\s]+)', text
+        )
+        if not match:
+            return {}
+        try:
+            details = {field: json.loads(match[1])}
+        except json.JSONDecodeError:
+            return {}
+    return details if isinstance(details, dict) else {}
+
+
+def _numeric_score(
+    value, score_range: tuple[float, float] | None = None
+) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(score) or (
+        score_range is not None and not score_range[0] <= score <= score_range[1]
+    ):
+        return None
+    return score
+
+
+@dataclass(frozen=True)
+class ScoreParser:
+    """Read a finite JSON score and retain evidence; optional bounds are inclusive."""
+
+    name: str = "json-score"
+    score_range: tuple[float, float] | None = None
+    result_type = ParsedScore
+    requires_top_logprobs = False
+
+    def parse_result(
+        self, judge_completion: str, *, top_logprobs=None
+    ) -> ParsedScore | None:
+        details = _json_judge_field(judge_completion, "score")
+        score = _numeric_score(details.get("score"), self.score_range)
+        if score is None:
+            return None
+        return ParsedScore(score=score, details=details)
 
 
 class AlpacaEvalToken(JudgeParser):
@@ -296,6 +368,48 @@ class PairScore(JudgeParser):
             return float(m.group(group_index).strip(" "))
 
 
+def _criterion_names(names: list[str]) -> tuple[str, ...]:
+    if (
+        not names
+        or len(set(names)) != len(names)
+        or any(
+            not name.strip() or name != name.strip() or "\n" in name or "\r" in name
+            for name in names
+        )
+    ):
+        raise ValueError("Expected nonempty, unique, single-line criterion names.")
+    return tuple(names)
+
+
+class CriteriaScoreParser:
+    """Require all configured criteria; retain their scores and equal-weight mean."""
+
+    name = "criteria-score"
+    result_type = ParsedScore
+    requires_top_logprobs = False
+
+    def __init__(self, names: list[str]):
+        self.names = _criterion_names(names)
+
+    def parse_result(
+        self, judge_completion: str, *, top_logprobs=None
+    ) -> ParsedScore | None:
+        details = _json_judge_field(judge_completion, "criteria")
+        raw = details.get("criteria")
+        if not isinstance(raw, dict) or set(raw) != set(self.names):
+            return None
+        scores = {}
+        for name in self.names:
+            score = _numeric_score(raw[name], (SCALE_MIN, SCALE_MAX))
+            if score is None:
+                return None
+            scores[name] = score
+        return ParsedScore(
+            score=sum(scores.values()) / len(scores),
+            details={**details, "criteria": scores},
+        )
+
+
 class CriteriaParser(PairScore):
     """Compare equally weighted criterion means, retaining every judge-slot score."""
 
@@ -303,16 +417,7 @@ class CriteriaParser(PairScore):
 
     def __init__(self, names: list[str], *, temperature: float = 0.3):
         super().__init__(temperature=temperature)
-        if (
-            not names
-            or len(set(names)) != len(names)
-            or any(
-                not name.strip() or name != name.strip() or "\n" in name or "\r" in name
-                for name in names
-            )
-        ):
-            raise ValueError("Expected nonempty, unique, single-line criterion names.")
-        self.names = tuple(names)
+        self.names = _criterion_names(names)
 
     def parse_result(
         self,
@@ -460,7 +565,9 @@ def parser_name(parse) -> str:
 
 # Parsers selectable by name for runtime prompt overrides (judge.parser);
 # presets reference these same instances.
-JUDGE_PARSERS: dict[str, JudgeParser] = {
+JUDGE_PARSERS: dict[str, OutputParser] = {
+    "json-score": ScoreParser(),
+    "single-score": ScoreParser("single-score", (SCALE_MIN, SCALE_MAX)),
     "score": PairScore(),
     "fastchat-verdict": FastChatVerdictParser(),
     "meta-eval-score": MetaEvalPairScore(),
@@ -470,7 +577,7 @@ JUDGE_PARSERS: dict[str, JudgeParser] = {
 }
 
 
-def resolve_judge_parser(name: str) -> JudgeParser:
+def resolve_judge_parser(name: str) -> OutputParser:
     """Return the registered judge parser named in a run config."""
     try:
         return JUDGE_PARSERS[name]

@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field, model_validator
 
 from judgearena.tasks.schema.base import StrictFrozenModel
-from judgearena.tasks.schema.baselines import BaselineSpec
+from judgearena.tasks.schema.baselines import BaselineSpec, NoBaseline
 from judgearena.tasks.schema.metrics import ScoringSpec
 
 
@@ -48,21 +48,26 @@ class MultiTurnGeneration(StrictFrozenModel):
 SwapMode = Literal["fixed", "both", "random"]
 
 
-class PairwiseJudgeSpec(StrictFrozenModel):
-    format: Literal["standard", "independent_scores"] = "standard"
+class JudgeSpec(StrictFrozenModel):
+    """Prompt selection and model defaults shared by judging protocols."""
+
     prompt_options: dict[str, Any] = Field(default_factory=dict)
     use_default_engine_kwargs: bool = True
-    minimum_score_by: tuple[str, ...] = ()
-    """Group candidate scores by these metadata columns before comparing minima."""
-    turns: Literal["all", "last"] | tuple[Annotated[int, Field(gt=0)], ...] = "all"
     default_prompt_preset: str = Field(min_length=1)
-    default_swap_mode: SwapMode = "fixed"
     default_temperature: float | None = None
     default_max_out_tokens: int | None = Field(default=None, gt=0)
     default_top_logprobs: int | None = Field(default=None, gt=0)
     category_prompts: dict[str, str] = Field(default_factory=dict)
     """Per-category prompt presets overriding ``default_prompt_preset`` (e.g. the
     Arena-Hard v2.0 creative-writing judge prompt)."""
+
+
+class PairwiseJudgeSpec(JudgeSpec):
+    format: Literal["standard", "independent_scores"] = "standard"
+    minimum_score_by: tuple[str, ...] = ()
+    """Group candidate scores by these metadata columns before comparing minima."""
+    turns: Literal["all", "last"] | tuple[Annotated[int, Field(gt=0)], ...] = "all"
+    default_swap_mode: SwapMode = "fixed"
 
     @model_validator(mode="after")
     def _validate_score_grouping(self) -> PairwiseJudgeSpec:
@@ -81,3 +86,14 @@ class PairwiseProtocol(StrictFrozenModel):
     baseline: BaselineSpec
     judge: PairwiseJudgeSpec
     scoring: ScoringSpec
+
+
+class SingleAnswerProtocol(StrictFrozenModel):
+    """Annotate each answer independently; metrics consume the parsed evidence."""
+
+    runner: Literal["single_answer"]
+    limit_by: str | None = Field(default=None, min_length=1)
+    generation: SingleTurnGeneration
+    baseline: NoBaseline = NoBaseline(strategy="none")
+    judge: JudgeSpec
+    scoring: ScoringSpec = ScoringSpec()

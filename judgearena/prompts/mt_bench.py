@@ -18,7 +18,7 @@ from judgearena.prompts.registry import (
     DEFAULT_JUDGE_PROMPT_PRESET,
     FASTCHAT_PAIRWISE_PROMPT_PRESET,
     ResolvedJudgePrompt,
-    build_pairwise_chat_prompt_template,
+    build_chat_prompt_template,
     resolve_run_judge_prompt,
 )
 from judgearena.tasks.schema.base import StrictFrozenModel
@@ -287,7 +287,7 @@ def render_mt_bench_requests(comparisons: pd.DataFrame, **kwargs):
     items = build_mt_bench_items(comparisons, **kwargs)
     for indices in group_indices_by_prompt_key(items).values():
         group = [items[i] for i in indices]
-        inputs = build_pairwise_chat_prompt_template(group[0].prompt).batch(
+        inputs = build_chat_prompt_template(group[0].prompt).batch(
             [item.prompt_kwargs for item in group]
         )
         yield [
@@ -349,6 +349,7 @@ def prepare_mt_bench_prompts(
     """Resolve prompt variants before generation and prepare comparison batches."""
     spec = cfg.resolved_task.spec.protocol.judge
     settings = MTBenchPromptOptions.model_validate(spec.prompt_options)
+    resolved_prompt.validate_for("pairwise", inference_kwargs=cfg.judge_model_kwargs())
     if cfg.judge.swap_mode not in ("fixed", "both"):
         raise ValueError(
             f"MT-Bench supports only swap_mode='fixed' or 'both'; got {cfg.judge.swap_mode!r}."

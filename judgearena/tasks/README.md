@@ -188,6 +188,39 @@ turn, numbered fields such as `{question_1}` and `{answer_a_2}` for two turns,
 and `{ref_answer_1}` and `{ref_answer_2}` for references. This format does not
 support parsers requiring token logprobs.
 
+## Independent evaluation
+
+Use `runner: single_answer` to annotate one answer per instruction. Dataset
+adapters return the same `CompletionData` contract: instructions plus optional
+saved model outputs. Select the saved model through `model.name`; missing
+answers are generated. `provided_messages` uses supplied conversation history.
+
+```yaml
+protocol:
+  runner: single_answer
+  generation:
+    mode: provided_messages
+  judge:
+    default_prompt_preset: single-score
+  scoring:
+    metrics:
+      - metric: mean_score
+        breakdown_by: [category]
+```
+
+The standard renderer supplies `{user_prompt}`, `{completion}`, their `_json`
+forms, and dataset metadata such as `{checklist}` or `{history}`. Required
+metadata is checked before generation. Each preset pairs its template with an
+`OutputParser`: `parse_result()` returns a dataclass, a JSON-compatible value,
+or `None` for an unparseable response. Parsed evidence is retained in `parsed`;
+a `score` field is also exposed as the `score` column. This supports correctness
+and criterion annotations without requiring scalar scores.
+
+Metrics receive these annotations through the same `calculate_metrics` used by
+pairwise evaluation. Omit `scoring` or use `metrics: []` to save annotations
+without metrics. The runner returns the annotation dataframe. A baseline and
+swapped judging are not used.
+
 ## Independent scoring
 
 To score each candidate separately and then compare scores, use
@@ -211,8 +244,8 @@ MT-Bench-101's adapter supplies the reference histories used by its prompt.
 ## Prompts and metrics
 
 A prompt preset defines the judge's output format and parser. Metrics consume
-battle dataframes. Select them in task YAML, with optional parameters and
-breakdowns:
+annotation or battle dataframes. Select them in task YAML, with optional
+parameters and breakdowns:
 
 ```yaml
 scoring:
@@ -228,10 +261,43 @@ Task loading validates metric names and parameters. Calculation failures and
 missing breakdown columns produce warnings and are skipped. Meta-evaluation
 supports its agreement/ranking/Elo-gap metrics without breakdowns.
 
+Standard pairwise prompt templates can reference adapter metadata columns such
+as `{history}` or `{checklist}`. Required fields are checked before generation.
+The shared renderer supplies `{user_prompt}`, `{completion_A}`, `{completion_B}`
+and their `_json` variants; these fields take precedence over source metadata
+and follow the actual answer order.
+
+Independent templates receive `{user_prompt}`, `{completion}`, their `_json`
+variants, and adapter metadata. Within a `single_answer` protocol, use:
+
+```yaml
+judge:
+  default_prompt_preset: single-score
+scoring:
+  metrics:
+    - metric: mean_score
+```
+
+`single-score` gives one overall score from 1 to 10. `criteria-score` uses the
+same rubric definitions as the pairwise `criteria` preset, selected through
+`judge.criteria_name` or `judge.criteria_file`. It retains each criterion's
+1–10 score in `parsed.details.criteria` and sets `score` to their equal-weight
+mean. Missing or invalid criteria make that annotation unparsed.
+
+`mean_score` averages available scores without normalization and reports sample
+and missing counts. For custom prompt files using another numeric scale, choose
+the `json-score` parser: it accepts a finite numeric `score` field and preserves
+the remaining JSON evidence. Benchmark tasks keep their configured defaults;
+these components can be selected in other task definitions.
+
 Use `judge.prompt.system_file` and `judge.prompt.user_file` with a registered
 `judge.prompt.parser` for custom prompts. For new implementations, see
 [prompt registration](../prompts/registry.py), [parsers](../prompts/parsing.py)
 and [metrics](../benchmarks/scoring.py).
+
+Independent scalar parsers return `ParsedScore` or `None`; other independent
+annotations may use a custom serializable result. Parsers declare `result_type`,
+and presets declare `judging_mode` as `pairwise` or `single_answer`.
 
 ## Add a workflow
 

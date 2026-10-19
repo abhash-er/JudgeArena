@@ -62,8 +62,9 @@ def run_elo(cfg: "RunConfig", task: ResolvedTaskSpec | None = None) -> dict:
         raise ValueError(f"Task {cfg.task!r} requires ELO runtime settings.")
     cfg.elo = cfg.elo.resolve(protocol.scoring)
     resolved_prompt = resolve_run_judge_prompt(task, cfg.judge)
-    if resolved_prompt.delegated or resolved_prompt.parser is None:
+    if resolved_prompt.delegated:
         raise ValueError("Elo judging requires a resolved preference parser.")
+    resolved_prompt.validate_for("pairwise", inference_kwargs=cfg.judge_model_kwargs())
     arena = protocol.arena
     run_started_at = datetime.now(UTC)
     rng = np.random.default_rng(cfg.run.seed)

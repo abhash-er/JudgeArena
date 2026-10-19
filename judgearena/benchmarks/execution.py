@@ -44,10 +44,7 @@ def build_generation_kwargs(
 
 def build_judge(cfg: RunConfig, *, default_temperature: float | None = None):
     """Prepare the judge and cache, retaining explicit settings over defaults."""
-    kwargs = cfg.judge.model_kwargs(
-        base_engine_kwargs=cfg.judge_engine_kwargs(),
-        fallback_chat_template=cfg.model.chat_template,
-    )
+    kwargs = cfg.judge_model_kwargs()
     if default_temperature is not None:
         kwargs.setdefault("temperature", default_temperature)
     return prepare_model(

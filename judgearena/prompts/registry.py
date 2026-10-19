@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -8,23 +9,28 @@ from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import pandas as pd
 from langchain_core.prompts import ChatPromptTemplate
 
 from judgearena.prompts.criteria import prompt_block, resolve_criteria
 
 if TYPE_CHECKING:
+    from judgearena.config import RunConfig
     from judgearena.tasks.schema import ResolvedTaskSpec
 
 from judgearena.prompts.parsing import (
     JUDGE_PARSERS,
     CriteriaParser,
-    JudgeParser,
+    CriteriaScoreParser,
     OutputParser,
+    ParsedPreference,
     parser_name,
     resolve_judge_parser,
+    validate_parser,
 )
 
 PromptSource = Literal["preset", "file", "override", "delegated"]
+JudgingMode = Literal["pairwise", "single_answer"]
 
 DEFAULT_JUDGE_PROMPT_PRESET = "default"
 DEFAULT_WITH_EXPLANATION_PRESET = "default_with_explanation"
@@ -59,7 +65,7 @@ FLUENCY_SYSTEM_PROMPT = (
 @dataclass(frozen=True)
 class JudgePromptPreset:
     name: str
-    parser: JudgeParser | None = None
+    parser: OutputParser | None = None
     """Parser for this preset; None when delegated or configured during resolution."""
     system_file: str | None = None
     user_file: str | None = None
@@ -71,10 +77,12 @@ class JudgePromptPreset:
     prepare_prompts: Callable | None = None
     """Optional (cfg, prompt, instructions) -> (batch preparation, temperature)."""
     score_renderer: Callable | None = None
-    """Optional scalar-score renderer: (samples, prompt_preset, truncate_input_chars,
-    strip_thinking_before_judging) -> (rendering fields, ParsedScore requests, prompts).
+    """Optional single-answer renderer: (samples, prompt_preset, truncate_input_chars,
+    strip_thinking_before_judging) -> (rendering fields, judge requests, prompts).
     Rows and requests follow the sample index; see judge_single_answers.
     """
+    judging_mode: JudgingMode = "pairwise"
+    """Number of candidates the prompt judges, independent of the task's runner."""
 
 
 @dataclass(frozen=True)
@@ -95,10 +103,40 @@ class ResolvedJudgePrompt:
     aggregation: Literal["individual", "agreement"] = "individual"
     prepare_prompts: Callable | None = None
     score_renderer: Callable | None = None
+    judging_mode: JudgingMode = "pairwise"
+
+    def validate_for(
+        self,
+        mode: JudgingMode,
+        result_type: type | None = None,
+        *,
+        inference_kwargs: dict[str, object] | None = None,
+    ) -> None:
+        """Check the operation and supplied model settings; defer unresolved parsers."""
+        if self.judging_mode != mode:
+            raise ValueError(
+                f"Prompt {self.preset_name!r} has judging mode {self.judging_mode!r}; "
+                f"requires {mode!r}."
+            )
+        if self.parser is None:
+            if self.delegated:
+                return
+            raise ValueError(f"Prompt {self.preset_name!r} requires a parser.")
+        validate_parser(
+            self.parser, ParsedPreference if mode == "pairwise" else result_type
+        )
+        if inference_kwargs is not None and self.parser.requires_top_logprobs:
+            count = inference_kwargs.get("top_logprobs")
+            if type(count) is not int or count <= 0:
+                raise ValueError(
+                    f"Prompt {self.preset_name!r} requires a positive integer "
+                    "top_logprobs setting."
+                )
 
     def metadata(self) -> dict[str, str | bool | None]:
         return {
             "judge_prompt_preset": self.preset_name,
+            "judge_prompt_mode": self.judging_mode,
             **(
                 {"judge_prompt_variant": self.variant_name} if self.variant_name else {}
             ),
@@ -115,7 +153,7 @@ class ResolvedJudgePrompt:
         }
 
 
-def build_pairwise_chat_prompt_template(
+def build_chat_prompt_template(
     prompt: ResolvedJudgePrompt,
 ) -> ChatPromptTemplate:
     message_templates: list[tuple[str, str]] = []
@@ -156,6 +194,19 @@ def _render_mt_bench_101_scores(samples, **kwargs):
 SCORE_PARSER = JUDGE_PARSERS["score"]
 
 PRESETS: dict[str, JudgePromptPreset] = {
+    "single-score": JudgePromptPreset(
+        name="single-score",
+        judging_mode="single_answer",
+        parser=JUDGE_PARSERS["single-score"],
+        user_file="single-answer.txt",
+        output_format_file="single-score.txt",
+    ),
+    "criteria-score": JudgePromptPreset(
+        name="criteria-score",
+        judging_mode="single_answer",
+        user_file="single-answer.txt",
+        output_format_file="single-criteria.txt",
+    ),
     "criteria": JudgePromptPreset(
         name="criteria",
         system_file="system-prompt.txt",
@@ -192,11 +243,13 @@ PRESETS: dict[str, JudgePromptPreset] = {
     ),
     MT_BENCH_101_PROMPT_PRESET: JudgePromptPreset(
         name=MT_BENCH_101_PROMPT_PRESET,
+        judging_mode="single_answer",
         delegated=True,
         score_renderer=_render_mt_bench_101_scores,
     ),
     MT_BENCH_101_CLEAN_PROMPT_PRESET: JudgePromptPreset(
         name=MT_BENCH_101_CLEAN_PROMPT_PRESET,
+        judging_mode="single_answer",
         delegated=True,
         score_renderer=_render_mt_bench_101_scores,
     ),
@@ -296,7 +349,8 @@ def _resolve_file_prompt(
     system_file: str | Path,
     user_file: str | Path,
     multi_turn: bool,
-    parser: JudgeParser,
+    parser: OutputParser,
+    judging_mode: JudgingMode,
 ) -> ResolvedJudgePrompt:
     system_path = Path(system_file)
     user_path = Path(user_file)
@@ -312,6 +366,7 @@ def _resolve_file_prompt(
         system_prompt=system_prompt,
         user_prompt_template=user_prompt_template,
         source="file",
+        judging_mode=judging_mode,
         system_path=str(system_path),
         user_path=str(user_path),
         system_sha256=_sha256(system_prompt),
@@ -329,13 +384,23 @@ def resolve_judge_prompt(
     parser: str | None = None,
     criteria_name: str | None = None,
     criteria_file: str | Path | None = None,
+    judging_mode: JudgingMode = "pairwise",
 ) -> ResolvedJudgePrompt:
+    """Load a preset, or custom files whose judging_mode is supplied by the caller.
+
+    Presets own their mode and parser; custom files use the requested mode and
+    named parser. Consumers validate compatibility before generating answers.
+    """
     if preset is None:
         preset = default_preset_for_task(task)
     if (criteria_name is not None or criteria_file is not None) and (
-        preset != "criteria" or system_file is not None or user_file is not None
+        preset not in ("criteria", "criteria-score")
+        or system_file is not None
+        or user_file is not None
     ):
-        raise ValueError("criteria options require the 'criteria' prompt preset.")
+        raise ValueError(
+            "criteria options require a 'criteria' or 'criteria-score' preset."
+        )
     if (system_file is None) != (user_file is None):
         raise ValueError(
             "Both --judge_system_prompt_file and --judge_user_prompt_file must "
@@ -347,6 +412,7 @@ def resolve_judge_prompt(
             user_file=user_file,
             multi_turn=multi_turn,
             parser=resolve_judge_parser(parser or "score"),
+            judging_mode=judging_mode,
         )
     if parser is not None:
         raise ValueError(
@@ -371,6 +437,7 @@ def resolve_judge_prompt(
             aggregation=spec.aggregation,
             prepare_prompts=spec.prepare_prompts,
             score_renderer=spec.score_renderer,
+            judging_mode=spec.judging_mode,
         )
 
     if spec.user_file is None:
@@ -379,7 +446,9 @@ def resolve_judge_prompt(
     system_prompt = (
         spec.inline_system
         if spec.inline_system is not None
-        else _load_packaged_text(spec.system_file)  # type: ignore[arg-type]
+        else _load_packaged_text(spec.system_file)
+        if spec.system_file is not None
+        else None
     )
     output_format = (
         _materialize_user_template(
@@ -396,14 +465,24 @@ def resolve_judge_prompt(
         with_explanation=spec.with_explanation,
     )
     resolved_parser = spec.parser
-    if preset == "criteria":
+    if preset in ("criteria", "criteria-score"):
         criteria = resolve_criteria(criteria_name or "default", criteria_file)
         names = [criterion.name for criterion in criteria]
-        resolved_parser = CriteriaParser(names)
+        resolved_parser = (
+            CriteriaParser(names)
+            if preset == "criteria"
+            else CriteriaScoreParser(names)
+        )
         fields = {
             "criteria_block": prompt_block(criteria),
             "criteria_output_lines": "\n".join(
                 f"{name}: A=<score>, B=<score>" for name in names
+            )
+            if preset == "criteria"
+            else json.dumps(
+                {"criteria": dict.fromkeys(names, "<score>")},
+                ensure_ascii=False,
+                indent=2,
             ),
         }
         # Substitute once: rubric text may contain literal braces or placeholder names.
@@ -424,12 +503,13 @@ def resolve_judge_prompt(
         source="preset",
         system_path=spec.system_file,
         user_path=spec.user_file,
-        system_sha256=_sha256(system_prompt),
+        system_sha256=_sha256(system_prompt) if system_prompt is not None else None,
         user_sha256=_sha256(user_prompt_template),
         output_format=output_format,
         aggregation=spec.aggregation,
         prepare_prompts=spec.prepare_prompts,
         score_renderer=spec.score_renderer,
+        judging_mode=spec.judging_mode,
     )
 
 
@@ -440,7 +520,22 @@ def resolve_run_judge_prompt(
     multi_turn: bool = False,
 ) -> ResolvedJudgePrompt:
     prompt = getattr(judge_cfg, "prompt", None)
+    if isinstance(task, str):
+        from judgearena.tasks.registry import get_packaged_task
+
+        task = get_packaged_task(task)
+    protocol = task.spec.protocol if task is not None else None
+    mode = (
+        "single_answer"
+        if protocol is not None
+        and (
+            protocol.runner == "single_answer"
+            or getattr(protocol.judge, "format", None) == "independent_scores"
+        )
+        else "pairwise"
+    )
     return resolve_judge_prompt(
+        judging_mode=mode,
         criteria_name=getattr(judge_cfg, "criteria_name", None),
         criteria_file=getattr(judge_cfg, "criteria_file", None),
         task=task,
@@ -450,3 +545,42 @@ def resolve_run_judge_prompt(
         multi_turn=multi_turn,
         parser=prompt.parser if prompt is not None else None,
     )
+
+
+def group_judge_prompts(
+    cfg: RunConfig,
+    instructions_df: pd.DataFrame,
+    resolved_prompt: ResolvedJudgePrompt,
+) -> list[tuple[ResolvedJudgePrompt, pd.Index]]:
+    """Group evaluation rows that share the same resolved judge prompt.
+
+    Tasks may map categories to prompt presets (e.g. Arena-Hard v2.0 judges
+    creative writing with a different system prompt). Runtime prompt overrides
+    (an explicit preset or prompt files) disable the per-category mapping.
+    """
+    category_prompts = getattr(
+        cfg.resolved_task.spec.protocol.judge, "category_prompts", {}
+    )
+    if (
+        not category_prompts
+        or (
+            cfg.judge.prompt_preset is not None
+            and cfg.judge.prompt_preset
+            != cfg.resolved_task.spec.protocol.judge.default_prompt_preset
+        )
+        or resolved_prompt.source != "preset"
+        or "category" not in instructions_df.columns
+    ):
+        return [(resolved_prompt, instructions_df.index)]
+
+    categories = instructions_df["category"]
+    groups: list[tuple[ResolvedJudgePrompt, pd.Index]] = []
+    for category, rows in categories.groupby(
+        categories, sort=False, dropna=False, observed=True
+    ):
+        preset = None if pd.isna(category) else category_prompts.get(category)
+        prompt = (
+            resolved_prompt if preset is None else resolve_judge_prompt(preset=preset)
+        )
+        groups.append((prompt, rows.index))
+    return groups

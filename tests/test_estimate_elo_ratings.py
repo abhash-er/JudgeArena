@@ -7,7 +7,7 @@ import pytest
 
 import judgearena.benchmarks.elo.calibration as elo_calibration
 import judgearena.benchmarks.elo.runner as estimate_elo_ratings
-import judgearena.benchmarks.pairwise.runner as pairwise_runner
+import judgearena.benchmarks.evaluation as pairwise_runner
 import judgearena.models as models
 from judgearena.benchmarks.elo.rating import (
     arena_anchor_battles,
@@ -20,8 +20,7 @@ from judgearena.config import RunConfig, load_config
 from judgearena.datasets.arena_battles import normalize_battles
 from judgearena.datasets.data import PreferenceData
 from judgearena.models import DummyModel, make_model
-from judgearena.prompts.parsing import PairScore
-from judgearena.prompts.registry import ResolvedJudgePrompt
+from judgearena.prompts.registry import resolve_judge_prompt
 from judgearena.tasks.registry import get_packaged_task
 from judgearena.tasks.schema import MetricSpec
 
@@ -248,7 +247,7 @@ def test_arena_data_also_runs_in_pairwise(tmp_path, monkeypatch, synthetic_arena
     data = normalize_battles(synthetic_arena_df, "ComparIA")
     monkeypatch.setattr(estimate_elo_ratings, "load_task_data", lambda _: data)
     monkeypatch.setattr(pairwise_runner, "load_task_data", lambda _: data)
-    prefs = pairwise_runner.run_pairwise(
+    prefs = pairwise_runner.run_evaluation(
         RunConfig(
             task="alpaca-eval-ja",
             model={"name": "Dummy/candidate", "baseline": ARENA_MODELS[0]},
@@ -691,21 +690,29 @@ def test_run_elo_temperature_reuses_validated_scores(monkeypatch, tmp_path):
     assert annotations["judge"].eq(cfg.judge.model).all()
 
 
-@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize(
+    "invalid", ["missing", "delegated", "scalar", "mode", "logprobs"]
+)
 def test_run_elo_rejects_unusable_prompt_before_generation(
-    monkeypatch, tmp_path, delegated
+    monkeypatch, tmp_path, invalid
 ):
+    prompt = resolve_judge_prompt(preset="default")
+    if invalid == "missing":
+        prompt = replace(prompt, parser=None)
+    elif invalid == "delegated":
+        prompt = replace(prompt, delegated=True)
+    elif invalid == "scalar":
+        prompt = replace(
+            prompt, parser=resolve_judge_prompt(preset="single-score").parser
+        )
+    elif invalid == "logprobs":
+        prompt = resolve_judge_prompt(preset="alpaca-eval")
+    else:
+        prompt = replace(prompt, judging_mode="single_answer")
     monkeypatch.setattr(
         estimate_elo_ratings,
         "resolve_run_judge_prompt",
-        lambda *_args: ResolvedJudgePrompt(
-            parser=PairScore() if delegated else None,
-            preset_name="unsupported",
-            system_prompt="",
-            user_prompt_template="",
-            source="delegated" if delegated else "override",
-            delegated=delegated,
-        ),
+        lambda *_args: prompt,
     )
     monkeypatch.setattr(
         estimate_elo_ratings,
@@ -714,5 +721,7 @@ def test_run_elo_rejects_unusable_prompt_before_generation(
             "Prompt validation must precede generation"
         ),
     )
-    with pytest.raises(ValueError, match="resolved preference parser"):
+    with pytest.raises(
+        ValueError, match="parser|ParsedPreference|judging mode|top_logprobs"
+    ):
         run_elo_with_task(_default_args(result_folder=str(tmp_path)))

@@ -4,7 +4,7 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
-import judgearena.benchmarks.pairwise.runner as mt_bench_runner
+import judgearena.benchmarks.evaluation as mt_bench_runner
 import judgearena.datasets.mt_bench as mt_bench
 import judgearena.utils as judgearena_utils
 from judgearena.config import RunConfig
@@ -93,7 +93,7 @@ def test_run_mt_bench_rejects_random_before_preparation(
     )
 
     with pytest.raises(ValueError, match="MT-Bench supports only.*got 'random'"):
-        mt_bench_runner.run_pairwise(cfg, get_packaged_task("mt-bench"))
+        mt_bench_runner.run_evaluation(cfg, get_packaged_task("mt-bench"))
 
 
 def test_mt_renderer_rejects_logprob_parser_before_preparation(
@@ -128,7 +128,7 @@ def test_mt_renderer_rejects_logprob_parser_before_preparation(
     )
 
     with pytest.raises(ValueError, match="MT-Bench does not support.*logprobs"):
-        mt_bench_runner.run_pairwise(cfg, get_packaged_task("mt-bench"))
+        mt_bench_runner.run_evaluation(cfg, get_packaged_task("mt-bench"))
 
 
 @pytest.mark.parametrize(

@@ -8,10 +8,10 @@ import pandas as pd
 import pytest
 from langchain_core.language_models.fake import FakeListLLM
 
-import judgearena.benchmarks.pairwise.runner as runner
+import judgearena.benchmarks.evaluation as runner
 import judgearena.datasets.mt_bench_101 as mt_bench_101
 import judgearena.models as models
-from judgearena.benchmarks.pairwise.runner import run_pairwise
+from judgearena.benchmarks.evaluation import run_evaluation
 from judgearena.benchmarks.pairwise.scoring.metrics import score_outcomes
 from judgearena.benchmarks.scoring import build_metric
 from judgearena.cache.sqlite import (
@@ -312,7 +312,7 @@ def test_run_mt_bench_101_dummy_reuses_cache(tmp_path, monkeypatch, with_preload
         },
     )
     task = get_packaged_task("mt-bench-101")
-    prefs = run_pairwise(cfg, task)
+    prefs = run_evaluation(cfg, task)
     assert prefs.tolist() == pytest.approx([0.5])
     report = json.loads(next(tmp_path.glob("*/results-*.json")).read_text())
     variants = report["metadata"]["judge_prompts"]
@@ -359,4 +359,4 @@ def test_run_mt_bench_101_dummy_reuses_cache(tmp_path, monkeypatch, with_preload
         raise AssertionError("cache hit materialized a model")
 
     monkeypatch.setattr(models, "make_model", fail_if_materialized)
-    assert run_pairwise(cfg, task).tolist() == prefs.tolist()
+    assert run_evaluation(cfg, task).tolist() == prefs.tolist()

@@ -134,10 +134,7 @@ def run_meta_eval(
             "Meta-evaluation cannot use delegated prompt preset "
             f"{resolved_prompt.preset_name!r}."
         )
-    if resolved_prompt.parser is None:
-        raise ValueError(
-            f"Prompt preset {resolved_prompt.preset_name!r} has no judge parser."
-        )
+    resolved_prompt.validate_for("pairwise", inference_kwargs=cfg.judge_model_kwargs())
     logger.info(
         "Sampled %d battles among the top %d models.", len(sample), len(top_models)
     )

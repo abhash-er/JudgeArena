@@ -12,13 +12,21 @@ import pandas as pd
 from judgearena.battles import agreement_outcomes, swap_comparison_slots
 from judgearena.benchmarks.pairwise.scoring.metrics import score_outcomes
 from judgearena.datasets.data import _require_columns, validate_messages
-from judgearena.evaluate import render_comparison_requests
+from judgearena.evaluate import (
+    prepare_single_answer_judging,
+    render_comparison_requests,
+    validate_battle_prompt_fields,
+)
 from judgearena.judging import (
     execute_pairwise,
-    judge_single_answers,
     pairwise_annotation_frame,
 )
-from judgearena.prompts.registry import ResolvedJudgePrompt, prompt_metadata
+from judgearena.prompts.parsing import ParsedScore
+from judgearena.prompts.registry import (
+    ResolvedJudgePrompt,
+    group_judge_prompts,
+    prompt_metadata,
+)
 from judgearena.utils import strip_thinking_tags
 
 if TYPE_CHECKING:
@@ -138,6 +146,8 @@ def judge_pairwise_batches(
     )
     direct_frames, reversed_frames = [], []
     for index, prompts, render in batches:
+        for prompt in prompts:
+            prompt.validate_for("pairwise")
         direct, reverse = execute_pairwise(
             judge_chat_model,
             judged.loc[index],
@@ -210,63 +220,25 @@ def judge_comparisons(
     return annotations
 
 
-def _build_judge_batches(
-    cfg: RunConfig,
-    instructions_df: pd.DataFrame,
-    resolved_prompt: ResolvedJudgePrompt,
-) -> list[tuple[ResolvedJudgePrompt, pd.Index]]:
-    """Group evaluation rows that share the same resolved judge prompt.
-
-    Tasks may map categories to prompt presets (e.g. Arena-Hard v2.0 judges
-    creative writing with a different system prompt). Runtime prompt overrides
-    (an explicit preset or prompt files) disable the per-category mapping.
-    """
-    category_prompts = getattr(
-        cfg.resolved_task.spec.protocol.judge, "category_prompts", {}
-    )
-    if (
-        not category_prompts
-        or (
-            cfg.judge.prompt_preset is not None
-            and cfg.judge.prompt_preset
-            != cfg.resolved_task.spec.protocol.judge.default_prompt_preset
-        )
-        or resolved_prompt.source != "preset"
-        or "category" not in instructions_df.columns
-    ):
-        return [(resolved_prompt, instructions_df.index)]
-
-    from judgearena.prompts.registry import resolve_judge_prompt
-
-    categories = instructions_df["category"]
-    groups: list[tuple[ResolvedJudgePrompt, pd.Index]] = []
-    for category, rows in categories.groupby(
-        categories, sort=False, dropna=False, observed=True
-    ):
-        preset = None if pd.isna(category) else category_prompts.get(category)
-        prompt = (
-            resolved_prompt if preset is None else resolve_judge_prompt(preset=preset)
-        )
-        groups.append((prompt, rows.index))
-    return groups
-
-
 def prepare_standard_prompts(
     cfg: RunConfig,
     resolved_prompt: ResolvedJudgePrompt,
     instructions: pd.DataFrame,
 ) -> tuple[Callable, float | None]:
     """Resolve standard prompt groups before generation and bind their renderers."""
-    groups = _build_judge_batches(cfg, instructions, resolved_prompt)
+    groups = group_judge_prompts(cfg, instructions, resolved_prompt)
     for prompt in [resolved_prompt, *(prompt for prompt, _ in groups)]:
+        prompt.validate_for("pairwise", inference_kwargs=cfg.judge_model_kwargs())
         if prompt.delegated:
             raise ValueError(
                 f"delegated prompt preset {prompt.preset_name!r} cannot be used for generic pairwise judging."
             )
 
+        validate_battle_prompt_fields(prompt, instructions.columns)
+
     def prepare(comparisons):
         selected = groups
-        if cfg.resolved_task.spec.protocol.generation.mode == "multi_turn_chat":
+        if "source_instruction_index" in comparisons:
             selected = [
                 (
                     prompt,
@@ -294,23 +266,15 @@ def prepare_pairwise_judging(
     """Bind prompt preparation and outcome policy to the shared judging loop."""
     spec = cfg.resolved_task.spec.protocol.judge
     if spec.format == "independent_scores":
-        if resolved_prompt.score_renderer is None:
-            raise ValueError(
-                "Independent scoring requires a prompt with a score renderer."
-            )
-        _require_columns(instructions, set(spec.minimum_score_by), "Score grouping")
-        render = partial(
-            resolved_prompt.score_renderer,
-            prompt_preset=resolved_prompt.preset_name,
-            truncate_input_chars=cfg.generation.truncate_judge_input_chars,
-            strip_thinking_before_judging=cfg.judge.strip_thinking_before_judging,
+        judge = prepare_single_answer_judging(
+            cfg, resolved_prompt, instructions, result_type=ParsedScore
         )
+        _require_columns(instructions, set(spec.minimum_score_by), "Score grouping")
         return partial(
             judge_independent_comparisons,
-            render=render,
+            judge=judge,
             prompt=resolved_prompt,
             minimum_by=spec.minimum_score_by,
-            use_tqdm=cfg.run.use_tqdm,
         ), None
     prepare_prompts = resolved_prompt.prepare_prompts or prepare_standard_prompts
     prepare, default_temperature = prepare_prompts(cfg, resolved_prompt, instructions)
@@ -332,21 +296,18 @@ def judge_independent_comparisons(
     model,
     comparisons: pd.DataFrame,
     *,
-    render: Callable,
+    judge: Callable,
     prompt: ResolvedJudgePrompt,
     minimum_by: tuple[str, ...] = (),
-    use_tqdm: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Grade all A answers, then all B answers, and compare their scalar scores."""
     scored = [
-        judge_single_answers(
+        judge(
             model,
             comparisons.assign(
                 model=comparisons[f"model_{slot}"],
                 completion=comparisons[f"completion_{slot}"],
             ),
-            render,
-            use_tqdm=use_tqdm,
         )
         for slot in ("a", "b")
     ]
@@ -368,7 +329,7 @@ def judge_independent_comparisons(
     )
     outcomes = score_outcomes(turns, minimum_by=minimum_by).assign(
         orientation="single",
-        prompt_preset=prompt.preset_name,
+        prompt_preset=prompt.preset_name if minimum_by else frames[0]["prompt_preset"],
     )
     return (
         annotations,

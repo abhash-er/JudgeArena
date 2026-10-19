@@ -111,3 +111,22 @@ def criteria_file(tmp_path):
 def test_criteria_parser_rejects_incomplete_or_invalid_scores(criteria_file, output):
     prompt = resolve_judge_prompt(preset="criteria", criteria_file=criteria_file)
     assert prompt.parser.parse_result(output) is None
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [
+        {"clarity": 8},
+        {"clarity": 8, "correctness": 6, "extra": 4},
+        {"clarity": True, "correctness": 6},
+        {"clarity": 0, "correctness": 6},
+        {"clarity": 8, "correctness": 11},
+    ],
+)
+def test_independent_criteria_requires_every_configured_score(criteria_file, scores):
+    import json
+
+    parser = resolve_judge_prompt(
+        preset="criteria-score", criteria_file=criteria_file
+    ).parser
+    assert parser.parse_result(json.dumps({"criteria": scores})) is None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 
 import pandas as pd
 from langchain_core.prompt_values import PromptValue
@@ -12,7 +12,12 @@ from judgearena.battles import swap_comparison_slots
 from judgearena.cache.inference import JudgementCacheRowMetadata
 from judgearena.log import get_logger
 from judgearena.models import InferenceResult, do_inference
-from judgearena.prompts.parsing import OutputParser, ParsedPreference
+from judgearena.prompts.parsing import (
+    OutputParser,
+    ParsedPreference,
+    parser_name,
+    validate_parser,
+)
 from judgearena.prompts.registry import ResolvedJudgePrompt
 
 
@@ -32,13 +37,19 @@ class JudgeResult[T]:
 
 
 def execute_judging[T](
-    model, requests: list[JudgeRequest[T]], *, use_tqdm: bool = False
+    model,
+    requests: list[JudgeRequest[T]],
+    *,
+    use_tqdm: bool = False,
+    result_type: type[T] | None = None,
 ) -> list[JudgeResult[T]]:
     """Execute rendered requests and retain raw responses alongside parsed results."""
     if not requests:
         return []
     if len({request.id for request in requests}) != len(requests):
         raise ValueError("Judging request IDs must be unique within a batch.")
+    for request in requests:
+        validate_parser(request.parser, result_type)
     metadata = [request.cache_metadata for request in requests]
     if any(row is not None for row in metadata) and any(
         row is None for row in metadata
@@ -53,16 +64,32 @@ def execute_judging[T](
         stage="judging",
         cache_row_metadata=metadata if metadata[0] is not None else None,
     )
-    return [
-        JudgeResult(
-            request=request,
-            response=response,
-            parsed=request.parser.parse_result(
+    results = []
+    missing_logprobs = 0
+    for request, response in zip(requests, responses, strict=True):
+        if (
+            request.parser.requires_top_logprobs
+            and not response.first_token_top_logprobs
+        ):
+            missing_logprobs += 1
+            parsed = None
+        else:
+            parsed = request.parser.parse_result(
                 response.text, top_logprobs=response.first_token_top_logprobs
-            ),
+            )
+        if parsed is not None and not isinstance(parsed, request.parser.result_type):
+            raise TypeError(
+                f"Parser {parser_name(request.parser)!r} must return "
+                f"{request.parser.result_type.__name__}; got {type(parsed).__name__}."
+            )
+        results.append(JudgeResult(request=request, response=response, parsed=parsed))
+    if missing_logprobs:
+        logger.warning(
+            "%d judgments lacked required first-token logprobs; "
+            "raw responses were retained and parsed results are missing.",
+            missing_logprobs,
         )
-        for request, response in zip(requests, responses, strict=True)
-    ]
+    return results
 
 
 def execute_pairwise(
@@ -122,7 +149,9 @@ def execute_pairwise(
             ]
             results.update(
                 (result.request.id, result)
-                for result in execute_judging(model, requests, use_tqdm=use_tqdm)
+                for result in execute_judging(
+                    model, requests, use_tqdm=use_tqdm, result_type=ParsedPreference
+                )
             )
         orders.append([results[identity] for identity in ids])
     return orders[0], orders[1] if swap_mode == "both" else None
@@ -174,7 +203,7 @@ def annotation_frame(
             for result in results
         ],
         parsed=[
-            None if result.parsed is None else asdict(result.parsed)
+            asdict(result.parsed) if is_dataclass(result.parsed) else result.parsed
             for result in results
         ],
         prompt_preset=[prompt.preset_name for prompt in prompts],
@@ -207,18 +236,28 @@ def pairwise_annotation_frame(
 
 
 def judge_single_answers(
-    model, samples: pd.DataFrame, render: Callable, *, use_tqdm: bool = False
+    model,
+    samples: pd.DataFrame,
+    render: Callable,
+    *,
+    use_tqdm: bool = False,
+    result_type: type | None = None,
 ) -> tuple[pd.DataFrame, list[ResolvedJudgePrompt]]:
     """Grade indexed samples containing model/completion and renderer metadata.
 
-    The renderer returns rendering-specific fields, ParsedScore requests, and
-    resolved prompts, all in sample order. Requests use stringified row IDs;
+    The renderer returns rendering-specific fields, parsed-result requests, and
+    resolved prompts, all in sample order. Dataclasses and JSON-compatible results
+    are preserved in ``parsed``; scalar result objects also populate ``score``.
+    Requests use stringified row IDs;
     instruction_id overrides cache identity. Return annotations and their prompts.
+    result_type restricts parsed outputs when a caller needs scalar scores.
     """
     ids = samples.index.map(str).tolist()
     if samples.index.isna().any() or len(set(ids)) != len(ids):
         raise ValueError("Samples require unique, nonmissing request IDs.")
     extras, requests, prompts = render(samples)
+    for prompt in prompts:
+        prompt.validate_for("single_answer", result_type)
     if (
         [request.id for request in requests] != ids
         or len(extras) != len(ids)
@@ -238,14 +277,16 @@ def judge_single_answers(
         )
         for request, row in zip(requests, samples.itertuples(), strict=True)
     ]
-    results = execute_judging(model, requests, use_tqdm=use_tqdm)
+    results = execute_judging(
+        model, requests, use_tqdm=use_tqdm, result_type=result_type
+    )
     rendered = samples.assign(
         **{column: extras[column].to_numpy() for column in extras}
     )
     annotations = annotation_frame(rendered, results, prompts).assign(
         evaluated_model=samples["model"].to_numpy(),
-        score=[
-            None if result.parsed is None else result.parsed.score for result in results
-        ],
+    )
+    annotations["score"] = annotations["parsed"].map(
+        lambda parsed: parsed.get("score") if isinstance(parsed, dict) else None
     )
     return annotations, prompts

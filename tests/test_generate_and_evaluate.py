@@ -7,15 +7,15 @@ import pandas as pd
 import pytest
 from langchain_core.language_models.fake import FakeListLLM
 
+import judgearena.benchmarks.evaluation as generate_and_evaluate
 import judgearena.benchmarks.execution as benchmark_execution
-import judgearena.benchmarks.pairwise.runner as generate_and_evaluate
 from judgearena.benchmarks.elo.rating import fit_bradley_terry
+from judgearena.benchmarks.evaluation import run_evaluation
 from judgearena.benchmarks.pairwise.baselines import (
     BaselinePlan,
-    native_pairwise_baseline,
     resolve_baseline_plan,
 )
-from judgearena.benchmarks.pairwise.runner import run_pairwise
+from judgearena.benchmarks.pairwise.judging import prepare_pairwise_judging
 from judgearena.cache.sqlite import JUDGEMENT_DB_NAME, JudgementCache
 from judgearena.config import RunConfig
 from judgearena.datasets.data import CompletionData
@@ -161,19 +161,6 @@ def test_resolve_plan_explicit_model_b_overrides_native():
     assert plan.single_model == "override"
 
 
-@pytest.mark.parametrize(
-    ("task", "expected"),
-    [
-        ("alpaca-eval", "gpt4_1106_preview"),
-        ("mt-bench", "gpt-3.5-turbo"),
-        ("m-arena-hard-v0.1-uk", "CohereLabs/aya-expanse-8b"),
-        ("m-arena-hard-v2.0-EU", "google/gemini-2.5-flash"),
-    ],
-)
-def test_native_pairwise_baseline_resolves_registered_tasks(task: str, expected: str):
-    assert native_pairwise_baseline(task) == expected
-
-
 def test_resolve_plan_task_without_native_baseline_requires_model_b():
     with pytest.raises(ValueError, match="baseline"):
         resolve_baseline_plan(
@@ -229,7 +216,7 @@ def test_baseline_plan_per_row_preserves_order():
     ],
 )
 def test_generate_and_evaluate_context_completion(task: str, tmp_path):
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         _cfg(
             task=task,
             model_A="Dummy/no answer",
@@ -278,7 +265,7 @@ def test_official_generation_receives_full_prompt_unless_explicitly_capped(
         run={"result_folder": str(tmp_path), "use_tqdm": False},
     )
 
-    run_pairwise(cfg)
+    run_evaluation(cfg)
 
     expected = instruction if expected_limit is None else instruction[:expected_limit]
     assert seen_inputs == [expected, expected]
@@ -291,7 +278,7 @@ def test_generate_and_evaluate_correct_order_bias(tmp_path):
     Since the judge favors model B regardless of the order and the completions, the average
     preference should be 0.5.
     """
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         _cfg(
             task="alpaca-eval-ja",
             model_A="Dummy/no answer",
@@ -335,7 +322,7 @@ def test_pairwise_bootstraps_use_run_seed(monkeypatch, tmp_path):
     task = _task_with_metric(
         MetricSpec(metric="bradley_terry", parameters={"n_bootstraps": 3})
     )
-    prefs = run_pairwise(cfg, task)
+    prefs = run_evaluation(cfg, task)
 
     battles = pd.DataFrame(
         {"model_a": cfg.model.name, "model_b": cfg.model.baseline, "pref": prefs}
@@ -365,7 +352,7 @@ def test_run_writes_roundtrippable_config(tmp_path, monkeypatch, caplog, failure
 
         monkeypatch.setattr(PairwiseWinRateMetric, failure, fail)
 
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         _cfg(
             task="alpaca-eval-ja",
             model_A="Dummy/no answer",
@@ -405,7 +392,7 @@ def test_run_writes_roundtrippable_config(tmp_path, monkeypatch, caplog, failure
         ("both", [0.25, np.nan, 0.25, 0.25, 0.75, 0.25]),
     ],
 )
-def test_run_pairwise_routes_arena_v2_baselines_and_prompts(
+def test_run_evaluation_routes_arena_v2_baselines_and_prompts(
     monkeypatch, tmp_path, swap_mode, expected_prefs
 ):
     raw = ["[[A>B]]", "no verdict", "[[A>B]]"]
@@ -458,7 +445,7 @@ def test_run_pairwise_routes_arena_v2_baselines_and_prompts(
         "load_task_data",
         lambda task, n_instructions=None: CompletionData(instructions, outputs),
     )
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         RunConfig(
             task="arena-hard-v2.0",
             model={"name": "candidate"},
@@ -516,7 +503,7 @@ def test_run_pairwise_routes_arena_v2_baselines_and_prompts(
     }
 
 
-def test_run_pairwise_weights_and_preserves_incomplete_alpaca_annotations(
+def test_run_evaluation_weights_and_preserves_incomplete_alpaca_annotations(
     monkeypatch, tmp_path, caplog
 ):
     valid = InferenceResult(
@@ -534,7 +521,7 @@ def test_run_pairwise_weights_and_preserves_incomplete_alpaca_annotations(
     missing = InferenceResult(text="M")
     judge_kwargs = _mock_alpaca_judge(monkeypatch, [valid, missing, valid, missing])
 
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         RunConfig(
             task="alpaca-eval",
             model={"name": "Dummy/a", "baseline": "Dummy/b"},
@@ -563,7 +550,7 @@ def test_all_missing_alpaca_judgments_save_empty_results(monkeypatch, tmp_path, 
         lambda **_kwargs: FakeListLLM(responses=["M"]),
     )
 
-    prefs = run_pairwise(
+    prefs = run_evaluation(
         RunConfig(
             task="alpaca-eval",
             model={"name": "Dummy/a", "baseline": "Dummy/b"},
@@ -678,7 +665,7 @@ def test_text_pairwise_uses_current_answers_despite_source_histories(
         )
     )
     monkeypatch.setattr(generate_and_evaluate, "load_task_data", lambda _: data)
-    run_pairwise(
+    run_evaluation(
         _cfg(
             task="arena-hard-v0.1",
             model_A="Dummy/current answer",
@@ -740,3 +727,86 @@ def test_multiturn_generation_batches_active_turns_and_reuses_history_cache(
     assert answers.iloc[0].messages[1]["content"] == "<think>hidden</think>answer"
     pd.testing.assert_frame_equal(generation.generate_multiturn(**kwargs), answers)
     assert len(calls) == 3
+
+
+def test_independent_score_presets_compare_expanded_candidates_in_order():
+    from judgearena.prompts.criteria import resolve_criteria
+    from judgearena.prompts.registry import resolve_run_judge_prompt
+
+    task = get_packaged_task("arena-hard-v2.0")
+    judge_spec = task.spec.protocol.judge.model_copy(
+        update={
+            "format": "independent_scores",
+            "default_prompt_preset": "single-score",
+            "category_prompts": {"creative": "criteria-score"},
+        }
+    )
+    task = replace(
+        task,
+        spec=task.spec.model_copy(
+            update={
+                "protocol": task.spec.protocol.model_copy(update={"judge": judge_spec}),
+            }
+        ),
+    )
+    cfg = RunConfig(
+        task=task.task,
+        resolved_task=task,
+        model={"name": "a"},
+        judge={"model": "Dummy/j"},
+    )
+    instructions = pd.DataFrame(
+        {
+            "instruction": ["Q1", "Q2"],
+            "category": ["creative", "other"],
+        },
+        index=["q1", "q2"],
+    )
+    comparisons = (
+        instructions.loc[["q2", "q1", "q2"]]
+        .assign(
+            source_instruction_index=["q2", "q1", "q2"],
+            model_a="a",
+            model_b=["b", "b", "c"],
+            completion_a=["A2", "A1", "A2"],
+            completion_b=["B2", "B1", "C2"],
+        )
+        .set_axis(["pair2", "pair1", "pair3"])
+    )
+    criteria_response = json.dumps(
+        {"criteria": {criterion.name: 6 for criterion in resolve_criteria()}}
+    )
+    model = FakeListLLM(
+        responses=[
+            criteria_response,
+            '{"score": 8}',
+            '{"score": 8}',
+            criteria_response,
+            '{"score": 4}',
+            "no score",
+        ]
+    )
+
+    judge, _ = prepare_pairwise_judging(
+        cfg,
+        resolve_run_judge_prompt(task, cfg.judge),
+        instructions,
+    )
+    annotations, outcomes, metadata = judge(model, comparisons)
+
+    assert all(
+        f"Answer: {row.completion}" in row.judge_input
+        and f"Question: Q{row.completion[-1]}" in row.judge_input
+        for row in annotations.itertuples()
+    )
+    assert annotations.instruction_index.tolist() == ["pair2", "pair1", "pair3"] * 2
+    assert annotations.completion.tolist() == ["A2", "A1", "A2", "B2", "B1", "C2"]
+    assert outcomes.pref.tolist() == pytest.approx(
+        [0.2314752165, 0.5, np.nan], nan_ok=True
+    )
+    expected_prompts = ["single-score", "criteria-score", "single-score"]
+    assert outcomes.prompt_preset.tolist() == expected_prompts
+    assert {p["judge_prompt_preset"] for p in metadata["judge_prompts"]} == set(
+        expected_prompts
+    )
+    assert annotations.iloc[1]["parsed"]["details"]["criteria"]["clarity"] == 6
