@@ -188,6 +188,22 @@ turn, numbered fields such as `{question_1}` and `{answer_a_2}` for two turns,
 and `{ref_answer_1}` and `{ref_answer_2}` for references. This format does not
 support parsers requiring token logprobs.
 
+## Multiple references
+
+A pairwise task can compare each candidate answer against every listed reference:
+
+```yaml
+baseline:
+  strategy: all_references
+  references: [reference-a, reference-b, reference-c]
+```
+
+The runner prepares each candidate answer once, then loads or generates the
+references. Comparison rows keep `source_instruction_index` and have unique IDs.
+The candidate must differ from the reference models. Change the list in the task
+definition; `model.baseline` cannot override it.
+`wildbench-reward-mix` uses this policy and averages per-reference WB-Rewards equally.
+
 ## Independent evaluation
 
 Use `runner: single_answer` to annotate one answer per instruction. Dataset
@@ -201,10 +217,10 @@ protocol:
   generation:
     mode: provided_messages
   judge:
-    default_prompt_preset: single-score
+    default_prompt_preset: wildbench-score
   scoring:
     metrics:
-      - metric: mean_score
+      - metric: wildbench_score
         breakdown_by: [category]
 ```
 

@@ -703,7 +703,7 @@ def test_run_elo_rejects_unusable_prompt_before_generation(
         prompt = replace(prompt, delegated=True)
     elif invalid == "scalar":
         prompt = replace(
-            prompt, parser=resolve_judge_prompt(preset="single-score").parser
+            prompt, parser=resolve_judge_prompt(preset="wildbench-score").parser
         )
     elif invalid == "logprobs":
         prompt = resolve_judge_prompt(preset="alpaca-eval")

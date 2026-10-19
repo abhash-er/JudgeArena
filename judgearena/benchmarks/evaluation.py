@@ -129,6 +129,9 @@ def run_evaluation(cfg: "RunConfig", resolved_task: ResolvedTaskSpec | None = No
         metrics,
         runtime_by_metric={
             "bradley_terry": {"rng": np.random.default_rng(cfg.run.seed)},
+            "wildbench_reward_mix": {
+                "references": baseline_plan.unique_models if baseline_plan else [],
+            },
         },
     )
 
@@ -161,7 +164,9 @@ def run_evaluation(cfg: "RunConfig", resolved_task: ResolvedTaskSpec | None = No
             result_folder=str(res_folder),
             preferences=result.tolist(),
             metadata={
-                "baseline_assignment": "flat"
+                "baseline_assignment": "all-references"
+                if not baseline_plan.baseline_by_index.index.is_unique
+                else "flat"
                 if baseline_plan.is_single_model
                 else "per-row",
                 "baseline_models": baseline_plan.unique_models,

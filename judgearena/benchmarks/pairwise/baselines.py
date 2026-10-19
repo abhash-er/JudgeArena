@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from judgearena.tasks.schema import (
+    AllReferencesBaseline,
     CategoryDefaultsBaseline,
     ResolvedTaskSpec,
     TaskDefaultBaseline,
@@ -15,7 +16,7 @@ from judgearena.tasks.schema import (
 
 @dataclass(frozen=True)
 class BaselinePlan:
-    """Row-aligned baseline assignment for model B."""
+    """Reference assignments indexed by source instruction; IDs may repeat."""
 
     baseline_by_index: pd.Series
 
@@ -63,6 +64,19 @@ def resolve_baseline_plan(
     instructions: pd.DataFrame,
 ) -> BaselinePlan:
     """Resolve a runtime override or the baseline declared by a task."""
+    if task is not None and isinstance(
+        task.spec.protocol.baseline, AllReferencesBaseline
+    ):
+        if runtime_baseline is not None:
+            raise ValueError("model.baseline cannot override an all_references policy.")
+        return BaselinePlan.per_row(
+            pd.concat(
+                [
+                    pd.Series(model, index=instructions.index)
+                    for model in task.spec.protocol.baseline.references
+                ]
+            )
+        )
     if runtime_baseline is not None:
         return BaselinePlan.flat(runtime_baseline, index=instructions.index)
 

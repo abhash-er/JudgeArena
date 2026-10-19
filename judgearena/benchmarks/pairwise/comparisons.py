@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
@@ -103,7 +104,9 @@ def conversation_comparisons(
             item = {
                 **row.to_dict(),
                 "comparison_id": f"{identity}:turn-{turn}",
-                "source_instruction_index": identity,
+                "source_instruction_index": row.get(
+                    "source_instruction_index", identity
+                ),
                 "question_id": row.get("question_id", identity),
                 "turn": turn,
                 "messages_a": prefix_a,
@@ -168,30 +171,28 @@ def prepare_comparisons(
 
     baseline = baseline_plan.aligned_to(instructions.index)
     a = prepare_answers(cfg, data, instructions, cfg.model.name, role="A")
-    b = pd.concat(
-        [
-            prepare_answers(
-                cfg,
-                data,
-                instructions.loc[baseline.index[baseline == model]],
-                model,
-                role="B",
-            )
-            for model in baseline_plan.unique_models
-        ]
-    ).reindex(instructions.index)
     column = "messages" if conversations else "completion"
     # Histories belong to the selected model outputs, not the source battle.
-    frame = instructions.drop(
+    candidate = instructions.drop(
         columns=["messages_a", "messages_b"], errors="ignore"
-    ).assign(
-        **{
-            f"{column}_a": a,
-            f"{column}_b": b,
-            "model_a": cfg.model.name,
-            "model_b": baseline,
-        }
-    )
+    ).assign(**{f"{column}_a": a, "model_a": cfg.model.name})
+    frames = []
+    for model in baseline_plan.unique_models:
+        ids = baseline.index[baseline == model]
+        b = prepare_answers(cfg, data, instructions.loc[ids], model, role="B")
+        frames.append(candidate.loc[ids].assign(**{f"{column}_b": b, "model_b": model}))
+    frame = pd.concat(frames)
+    if baseline.index.is_unique:
+        frame = frame.loc[instructions.index]
+    else:
+        frame["source_instruction_index"] = frame.index
+        frame.index = pd.Index(
+            [
+                json.dumps([str(identity), model])
+                for identity, model in zip(frame.index, frame["model_b"], strict=True)
+            ],
+            name="comparison_id",
+        )
     # Supplied histories may carry stable turn IDs for generation and judging.
     internal = (
         ["cache_orientation"]

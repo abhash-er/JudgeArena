@@ -22,6 +22,7 @@ from judgearena.models import build_default_judge_model_kwargs
 from judgearena.prompts.parsing import resolve_judge_parser
 from judgearena.tasks.registry import get_packaged_task
 from judgearena.tasks.schema import (
+    AllReferencesBaseline,
     CategoryDefaultsBaseline,
     EloProtocol,
     EloScoringSpec,
@@ -592,6 +593,15 @@ class RunConfig(BaseSettings):
                 if self.model.baseline is not None or self.judge.swap_mode != "fixed":
                     raise ValueError(
                         "Independent single-answer evaluation does not use a baseline or swapped judging."
+                    )
+            elif isinstance(protocol.baseline, AllReferencesBaseline):
+                if self.model.name in protocol.baseline.references:
+                    raise ValueError(
+                        "model.name must differ from the all_references models."
+                    )
+                if self.model.baseline is not None:
+                    raise ValueError(
+                        "model.baseline cannot override an all_references policy."
                     )
             elif self.model.baseline is None and not isinstance(
                 protocol.baseline, (TaskDefaultBaseline, CategoryDefaultsBaseline)
