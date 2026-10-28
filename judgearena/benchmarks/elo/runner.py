@@ -86,10 +86,20 @@ def run_elo(cfg: "RunConfig", task: ResolvedTaskSpec | None = None) -> dict:
             seed=cfg.run.seed,
         )
     else:
-        # Keep at most n_instructions_per_language per language
+        # Keep at most n_instructions_per_language per language, as a seeded
+        # random sample within each language rather than the first rows in
+        # dataset order (which would cluster in one period of the arena). The
+        # seed is fixed per run config, so every evaluated model and judge sees
+        # the same battles.
         if cfg.elo.n_instructions_per_language is not None:
+            sampling_metadata = {
+                "sampling_mode": "seeded_random_per_language",
+                "seed": cfg.run.seed,
+                "n_per_language": cfg.elo.n_instructions_per_language,
+            }
             df_battles = (
-                df_battles.groupby("lang")
+                df_battles.sample(frac=1.0, random_state=cfg.run.seed)
+                .groupby("lang")
                 .head(cfg.elo.n_instructions_per_language)
                 .reset_index(drop=True)
             )

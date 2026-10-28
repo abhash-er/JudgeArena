@@ -1067,6 +1067,11 @@ def make_model(model: str, max_tokens: int | None = 8192, **engine_kwargs):
 
     logger.info("Loading %s(model=%s)", model_provider, model_name)
 
+    if model_provider == "JEV9B":
+        from judgearena.jev9b import ChatJEV9B
+
+        return ChatJEV9B(model=model_name, **engine_kwargs)
+
     # Use our custom ChatVLLM wrapper which properly applies chat templates
     if model_provider == "VLLM":
         engine_kwargs = {k: v for k, v in engine_kwargs.items() if v is not None}

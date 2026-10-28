@@ -363,6 +363,54 @@ class AlpacaEvalJSON(JudgeParser):
         )
 
 
+class JevChoice(JudgeParser):
+    """Soft preference from the JEV9B judge's Choice distribution.
+
+    The JEV9B wrapper (judgearena.jev9b) replies with a JSON line holding the
+    calibrated probabilities of ``A>B``, ``B>A`` and ``A=B``, followed by the
+    verdict label of the most likely option. The preference is the expected
+    outcome, P(B>A) + 0.5 * P(A=B), so soft ELO uses the full distribution.
+    """
+
+    name = "jev-choice"
+
+    def __call__(
+        self,
+        judge_completion: str,
+        *,
+        top_logprobs: dict[str, float] | None = None,
+    ) -> float | None:
+        result = self.parse_result(judge_completion, top_logprobs=top_logprobs)
+        return None if result is None else result.preference
+
+    def parse_result(
+        self,
+        judge_completion: str,
+        *,
+        top_logprobs: dict[str, float] | None = None,
+    ) -> ParsedPreference | None:
+        try:
+            first_line = judge_completion.strip().splitlines()[0]
+            probabilities = json.loads(first_line)["probabilities"]
+            p_a, p_b, p_tie = (
+                float(probabilities[key]) for key in ("A>B", "B>A", "A=B")
+            )
+        except (IndexError, KeyError, TypeError, ValueError):
+            return None
+        total = p_a + p_b + p_tie
+        if not total > 0:
+            return None
+        preference = min(1.0, max(0.0, (p_b + 0.5 * p_tie) / total))
+        label = max(
+            (("A>B", p_a), ("B>A", p_b), ("A=B", p_tie)), key=lambda item: item[1]
+        )[0]
+        return ParsedPreference(
+            preference=preference,
+            label=label,
+            details={"probabilities": {"A>B": p_a, "B>A": p_b, "A=B": p_tie}},
+        )
+
+
 def parser_name(parse) -> str:
     """Short identifier of a parser for run metadata.
 
@@ -380,6 +428,7 @@ JUDGE_PARSERS: dict[str, JudgeParser] = {
     "arena-hard-verdict": ArenaHardVerdict(),
     "alpaca-eval-json": AlpacaEvalJSON(),
     "alpaca-eval-token": AlpacaEvalToken(),
+    "jev-choice": JevChoice(),
 }
 
 

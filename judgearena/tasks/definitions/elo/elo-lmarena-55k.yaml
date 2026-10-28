@@ -1,0 +1,21 @@
+extends: _base.yaml
+task: elo-lmarena-55k
+description: Arena-anchored ELO evaluation using LMSYS Chatbot Arena 55k battles.
+
+variants:
+  selector: language
+  values: [en, pl, ru, zh, de, ja, es, fr, ko, pt, fa, it, tr, vi, cs, ar, uk]
+
+dataset:
+  sources:
+    lmarena_55k:
+      type: huggingface_dataset
+      repo_id: lmarena-ai/arena-human-preference-55k
+      revision: "18c298340948c0e7f7727399fd459cca6ce0ca6f"
+      allow_patterns: [train.csv]
+
+protocol:
+  arena: LMArena-55k
+
+metadata:
+  reference_implementation: https://huggingface.co/datasets/lmarena-ai/arena-human-preference-55k
